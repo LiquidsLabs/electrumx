@@ -2084,27 +2084,330 @@ class PIVXSaplingElectrumX(ElectrumX):
 
     Provides RPC methods for querying Sapling nullifiers, commitments,
     and anchors to support light wallet functionality (e.g., Cake Wallet).
+
+    Key APIs for Cake Wallet integration:
+    - blockchain.sapling.get_outputs: Trial decryption data for receiving
+    - blockchain.sapling.get_witness: Merkle path for spend proof construction
+    - blockchain.sapling.get_nullifiers: Spent note detection
+    - blockchain.sapling.get_tree_state: Sync state
+    - blockchain.nullifier.get_spend: Single nullifier lookup
     '''
+
+    # Max limits for bulk queries to prevent DoS
+    MAX_OUTPUT_LIMIT = 10000
+    MAX_NULLIFIER_LIMIT = 10000
 
     def set_request_handlers(self, ptuple):
         super().set_request_handlers(ptuple)
         self.request_handlers.update({
-            'blockchain.transaction.get_sapling':
-                self.transaction_get_sapling,
-            'blockchain.sapling.nullifier_status':
-                self.sapling_nullifier_status,
-            'blockchain.sapling.get_output_by_commitment':
-                self.sapling_get_output_by_commitment,
-            'blockchain.sapling.verify_anchor':
-                self.sapling_verify_anchor,
-            'blockchain.sapling.get_spends':
-                self.sapling_get_spends,
+            # Core Cake Wallet APIs
             'blockchain.sapling.get_outputs':
                 self.sapling_get_outputs,
+            'blockchain.sapling.get_witness':
+                self.sapling_get_witness,
+            'blockchain.sapling.get_nullifiers':
+                self.sapling_get_nullifiers,
+            'blockchain.sapling.get_tree_state':
+                self.sapling_get_tree_state,
+            'blockchain.nullifier.get_spend':
+                self.nullifier_get_spend,
+            # Additional utility methods
+            'blockchain.commitment.get_info':
+                self.commitment_get_info,
+            'blockchain.anchor.get_height':
+                self.anchor_get_height,
+            'blockchain.transaction.get_sapling':
+                self.transaction_get_sapling,
         })
 
+    # =========================================================================
+    # CAKE WALLET CORE APIs
+    # =========================================================================
+
+    async def sapling_get_outputs(
+            self,
+            start_height: int,
+            end_height: int,
+            limit: int = 1000
+    ):
+        '''Get Sapling outputs for trial decryption (RECEIVING).
+
+        Returns outputs with data needed for trial decryption:
+        txid, index, cmu, epk (ephemeral_key), enc_ciphertext
+
+        start_height: starting block height (inclusive)
+        end_height: ending block height (inclusive)
+        limit: maximum number of outputs to return (default 1000)
+
+        Returns list of outputs for trial decryption.
+        '''
+        from electrumx.lib.tx import TxPIVXSapling
+
+        start_height = non_negative_integer(start_height)
+        end_height = non_negative_integer(end_height)
+        limit = min(non_negative_integer(limit), self.MAX_OUTPUT_LIMIT)
+
+        if end_height < start_height:
+            raise RPCError(BAD_REQUEST, 'end_height must be >= start_height')
+
+        # Cost based on range size
+        self.bump_cost(2.0 + (end_height - start_height) * 0.1)
+
+        outputs = []
+        output_count = 0
+
+        for height in range(start_height, end_height + 1):
+            if output_count >= limit:
+                break
+
+            # Get block hash at height
+            try:
+                block_hash = await self.daemon_request('getblockhash', height)
+            except DaemonError:
+                break  # Height doesn't exist yet
+
+            # Get full block
+            try:
+                block_hex = await self.daemon_request('getblock', block_hash, 0)
+            except DaemonError:
+                continue
+
+            block_data = bytes.fromhex(block_hex)
+            header_size = self.coin.header_len(height)
+
+            # Deserialize transactions
+            deserializer = self.coin.DESERIALIZER(
+                block_data, start=header_size
+            )
+            tx_count = deserializer.read_varint()
+
+            for _ in range(tx_count):
+                if output_count >= limit:
+                    break
+
+                tx = deserializer.read_tx()
+                if isinstance(tx, TxPIVXSapling) and tx.sapling_outputs:
+                    txid = tx.txid.hex()
+                    for idx, output in enumerate(tx.sapling_outputs):
+                        if output_count >= limit:
+                            break
+                        outputs.append({
+                            'txid': txid,
+                            'index': idx,
+                            'height': height,
+                            'cmu': output.cmu.hex(),
+                            'epk': output.ephemeral_key.hex(),
+                            'enc_ciphertext': output.enc_ciphertext.hex(),
+                        })
+                        output_count += 1
+
+        return {
+            'outputs': outputs,
+            'count': len(outputs),
+            'start_height': start_height,
+            'end_height': end_height,
+            'more': output_count >= limit,
+        }
+
+    async def sapling_get_witness(
+            self,
+            commitment_hex: str,
+            anchor_height: int
+    ):
+        '''Get Merkle witness for a commitment (SENDING/spend proof).
+
+        Returns the position and Merkle path needed to construct
+        a spend proof for a shielded note.
+
+        commitment_hex: 32-byte commitment (cmu) as hex string
+        anchor_height: block height of the anchor to use
+
+        Returns: position, path (32 hashes), anchor
+        '''
+        self.bump_cost(5.0)  # Expensive operation
+
+        # Validate inputs
+        assert_hex_str(commitment_hex)
+        if len(commitment_hex) != 64:
+            raise RPCError(BAD_REQUEST, 'commitment must be 32 bytes (64 hex)')
+        anchor_height = non_negative_integer(anchor_height)
+
+        commitment = bytes.fromhex(commitment_hex)
+
+        # Get commitment info to find its position
+        commitment_info = self.db.get_commitment_info(commitment)
+        if commitment_info is None:
+            raise RPCError(BAD_REQUEST, 'commitment not found')
+
+        tx_hash, output_index, commit_height = commitment_info
+
+        if commit_height > anchor_height:
+            raise RPCError(
+                BAD_REQUEST,
+                'commitment height is after anchor height'
+            )
+
+        # Get witness data from the database
+        witness = self.db.get_sapling_witness(commitment, anchor_height)
+        if witness is None:
+            # Witness computation not yet implemented
+            # Return error with helpful message
+            raise RPCError(
+                BAD_REQUEST,
+                'witness computation requires incremental merkle tree - '
+                'not yet implemented. Use full node for spending.'
+            )
+
+        position, path, anchor = witness
+
+        return {
+            'position': position,
+            'path': [h.hex() for h in path],
+            'anchor': anchor.hex(),
+            'commitment': commitment_hex,
+            'commitment_height': commit_height,
+        }
+
+    async def sapling_get_nullifiers(
+            self,
+            start_height: int,
+            end_height: int
+    ):
+        '''Get nullifiers spent in a height range (SYNC).
+
+        start_height: starting block height (inclusive)
+        end_height: ending block height (inclusive)
+
+        Returns list of {nullifier, txid, height}.
+        '''
+        start_height = non_negative_integer(start_height)
+        end_height = non_negative_integer(end_height)
+
+        if end_height < start_height:
+            raise RPCError(BAD_REQUEST, 'end_height must be >= start_height')
+
+        self.bump_cost(1.0 + (end_height - start_height) * 0.05)
+
+        nullifiers = self.db.iter_nullifiers_by_height(
+            start_height, end_height
+        )
+
+        return {
+            'nullifiers': [
+                {
+                    'nullifier': nf.hex(),
+                    'txid': hash_to_hex_str(tx_hash),
+                    'height': height,
+                }
+                for nf, tx_hash, height in nullifiers
+            ],
+            'start_height': start_height,
+            'end_height': end_height,
+        }
+
+    async def sapling_get_tree_state(self, height: int = None):
+        '''Get Sapling commitment tree state (SYNC).
+
+        height: block height (if None, uses current tip)
+
+        Returns tree state including commitment count and latest anchor.
+        '''
+        if height is not None:
+            height = non_negative_integer(height)
+        else:
+            height = self.db.db_height
+
+        self.bump_cost(2.0)
+
+        # Get block info
+        try:
+            block_hash = await self.daemon_request('getblockhash', height)
+        except DaemonError:
+            raise RPCError(BAD_REQUEST, f'height {height} not found')
+
+        tree_state = self.db.get_sapling_tree_state(height)
+        tree_state['block_hash'] = block_hash
+
+        return tree_state
+
+    async def nullifier_get_spend(self, nullifier_hex: str):
+        '''Check if a Sapling nullifier has been spent (SYNC).
+
+        nullifier_hex: 32-byte nullifier as hex string
+
+        Returns tx info if spent, null if unspent.
+        '''
+        self.bump_cost(0.5)
+
+        # Validate nullifier
+        assert_hex_str(nullifier_hex)
+        if len(nullifier_hex) != 64:
+            raise RPCError(BAD_REQUEST, 'nullifier must be 32 bytes (64 hex)')
+
+        nullifier = bytes.fromhex(nullifier_hex)
+        result = self.db.get_nullifier_spend(nullifier)
+
+        if result is None:
+            return None
+
+        tx_hash, height = result
+        return {
+            'txid': hash_to_hex_str(tx_hash),
+            'height': height,
+        }
+
+    # =========================================================================
+    # UTILITY APIs
+    # =========================================================================
+
+    async def commitment_get_info(self, commitment_hex: str):
+        '''Find the transaction containing a specific commitment (cmu).
+
+        commitment_hex: 32-byte commitment as hex string
+
+        Returns tx info and output index if found.
+        '''
+        self.bump_cost(0.5)
+
+        # Validate commitment
+        assert_hex_str(commitment_hex)
+        if len(commitment_hex) != 64:
+            raise RPCError(BAD_REQUEST, 'commitment must be 32 bytes (64 hex)')
+
+        commitment = bytes.fromhex(commitment_hex)
+        result = self.db.get_commitment_info(commitment)
+
+        if result is None:
+            return None
+
+        tx_hash, output_index, height = result
+        return {
+            'txid': hash_to_hex_str(tx_hash),
+            'output_index': output_index,
+            'height': height,
+        }
+
+    async def anchor_get_height(self, anchor_hex: str):
+        '''Get the height at which a Sapling anchor was valid.
+
+        anchor_hex: 32-byte anchor as hex string
+
+        Returns height if valid, null if not found.
+        '''
+        self.bump_cost(0.5)
+
+        # Validate anchor
+        assert_hex_str(anchor_hex)
+        if len(anchor_hex) != 64:
+            raise RPCError(BAD_REQUEST, 'anchor must be 32 bytes (64 hex)')
+
+        anchor = bytes.fromhex(anchor_hex)
+        height = self.db.get_anchor_height(anchor)
+
+        return height  # Returns None if not found
+
     async def transaction_get_sapling(self, tx_hash_hex: str, verbose=False):
-        '''Get Sapling shielded transaction details.
+        '''Get Sapling transaction details.
 
         tx_hash_hex: transaction hash as hex string
         verbose: if True, include full Sapling component data
@@ -2112,19 +2415,19 @@ class PIVXSaplingElectrumX(ElectrumX):
         Returns transaction with Sapling details if it's a Sapling tx.
         '''
         from electrumx.lib.tx import TxPIVXSapling
-        from electrumx.lib.hash import hex_str_to_hash
 
         self.bump_cost(1.0)
 
         # Validate tx hash
-        tx_hash = assert_tx_hash(tx_hash_hex)
+        assert_tx_hash(tx_hash_hex)
 
         # Get raw transaction from daemon
         try:
-            raw_tx_hex = await self.daemon_request('getrawtransaction',
-                                                   tx_hash_hex, False)
+            raw_tx_hex = await self.daemon_request(
+                'getrawtransaction', tx_hash_hex, False
+            )
         except DaemonError:
-            raise RPCError(BAD_REQUEST, f'transaction not found: {tx_hash_hex}')
+            raise RPCError(BAD_REQUEST, f'tx not found: {tx_hash_hex}')
 
         # Deserialize the transaction
         raw_tx = bytes.fromhex(raw_tx_hex)
@@ -2144,188 +2447,23 @@ class PIVXSaplingElectrumX(ElectrumX):
             if verbose:
                 result['spends'] = [
                     {
-                        'cv': spend.cv.hex(),
-                        'anchor': spend.anchor.hex(),
                         'nullifier': spend.nullifier.hex(),
+                        'anchor': spend.anchor.hex(),
+                        'cv': spend.cv.hex(),
                         'rk': spend.rk.hex(),
                     }
                     for spend in tx.sapling_spends
                 ]
                 result['outputs'] = [
                     {
-                        'cv': output.cv.hex(),
                         'cmu': output.cmu.hex(),
-                        'ephemeral_key': output.ephemeral_key.hex(),
+                        'epk': output.ephemeral_key.hex(),
                         'enc_ciphertext': output.enc_ciphertext.hex(),
-                        'out_ciphertext': output.out_ciphertext.hex(),
+                        'cv': output.cv.hex(),
                     }
                     for output in tx.sapling_outputs
                 ]
 
         return result
 
-    async def sapling_nullifier_status(self, nullifier_hex: str):
-        '''Check if a Sapling nullifier has been spent.
 
-        nullifier_hex: 32-byte nullifier as hex string
-
-        Returns dict with spent status and tx info if spent.
-        '''
-        self.bump_cost(0.5)
-
-        # Validate nullifier
-        assert_hex_str(nullifier_hex)
-        if len(nullifier_hex) != 64:
-            raise RPCError(BAD_REQUEST, 'nullifier must be 32 bytes (64 hex)')
-
-        nullifier = bytes.fromhex(nullifier_hex)
-        result = self.db.get_nullifier_spend(nullifier)
-
-        if result is None:
-            return {'spent': False}
-
-        tx_hash, height = result
-        return {
-            'spent': True,
-            'tx_hash': hash_to_hex_str(tx_hash),
-            'height': height,
-        }
-
-    async def sapling_get_output_by_commitment(self, commitment_hex: str):
-        '''Find the output containing a specific note commitment (cmu).
-
-        commitment_hex: 32-byte commitment as hex string
-
-        Returns tx info and output index if found.
-        '''
-        self.bump_cost(0.5)
-
-        # Validate commitment
-        assert_hex_str(commitment_hex)
-        if len(commitment_hex) != 64:
-            raise RPCError(BAD_REQUEST, 'commitment must be 32 bytes (64 hex)')
-
-        commitment = bytes.fromhex(commitment_hex)
-        result = self.db.get_commitment_info(commitment)
-
-        if result is None:
-            return {'found': False}
-
-        tx_hash, output_index, height = result
-        return {
-            'found': True,
-            'tx_hash': hash_to_hex_str(tx_hash),
-            'output_index': output_index,
-            'height': height,
-        }
-
-    async def sapling_verify_anchor(self, anchor_hex: str):
-        '''Verify that a Sapling Merkle tree anchor exists.
-
-        anchor_hex: 32-byte anchor as hex string
-
-        Returns validity and the height at which it was recorded.
-        '''
-        self.bump_cost(0.5)
-
-        # Validate anchor
-        assert_hex_str(anchor_hex)
-        if len(anchor_hex) != 64:
-            raise RPCError(BAD_REQUEST, 'anchor must be 32 bytes (64 hex)')
-
-        anchor = bytes.fromhex(anchor_hex)
-        height = self.db.get_anchor_height(anchor)
-
-        if height is None:
-            return {'valid': False}
-
-        return {
-            'valid': True,
-            'height': height,
-        }
-
-    async def sapling_get_spends(self, tx_hash_hex: str):
-        '''Get Sapling spend details for a transaction.
-
-        tx_hash_hex: transaction hash as hex string
-
-        Returns list of spend details.
-        '''
-        from electrumx.lib.tx import TxPIVXSapling
-
-        self.bump_cost(1.0)
-
-        # Validate tx hash
-        assert_tx_hash(tx_hash_hex)
-
-        # Get raw transaction from daemon
-        try:
-            raw_tx_hex = await self.daemon_request('getrawtransaction',
-                                                   tx_hash_hex, False)
-        except DaemonError:
-            raise RPCError(BAD_REQUEST, f'transaction not found: {tx_hash_hex}')
-
-        # Deserialize the transaction
-        raw_tx = bytes.fromhex(raw_tx_hex)
-        deserializer = self.coin.DESERIALIZER(raw_tx)
-        tx = deserializer.read_tx()
-
-        if not isinstance(tx, TxPIVXSapling):
-            return {'spends': []}
-
-        return {
-            'spends': [
-                {
-                    'cv': spend.cv.hex(),
-                    'anchor': spend.anchor.hex(),
-                    'nullifier': spend.nullifier.hex(),
-                    'rk': spend.rk.hex(),
-                    'zkproof': spend.zkproof.hex(),
-                    'spend_auth_sig': spend.spend_auth_sig.hex(),
-                }
-                for spend in tx.sapling_spends
-            ]
-        }
-
-    async def sapling_get_outputs(self, tx_hash_hex: str):
-        '''Get Sapling output details for a transaction.
-
-        tx_hash_hex: transaction hash as hex string
-
-        Returns list of output details.
-        '''
-        from electrumx.lib.tx import TxPIVXSapling
-
-        self.bump_cost(1.0)
-
-        # Validate tx hash
-        assert_tx_hash(tx_hash_hex)
-
-        # Get raw transaction from daemon
-        try:
-            raw_tx_hex = await self.daemon_request('getrawtransaction',
-                                                   tx_hash_hex, False)
-        except DaemonError:
-            raise RPCError(BAD_REQUEST, f'transaction not found: {tx_hash_hex}')
-
-        # Deserialize the transaction
-        raw_tx = bytes.fromhex(raw_tx_hex)
-        deserializer = self.coin.DESERIALIZER(raw_tx)
-        tx = deserializer.read_tx()
-
-        if not isinstance(tx, TxPIVXSapling):
-            return {'outputs': []}
-
-        return {
-            'outputs': [
-                {
-                    'cv': output.cv.hex(),
-                    'cmu': output.cmu.hex(),
-                    'ephemeral_key': output.ephemeral_key.hex(),
-                    'enc_ciphertext': output.enc_ciphertext.hex(),
-                    'out_ciphertext': output.out_ciphertext.hex(),
-                    'zkproof': output.zkproof.hex(),
-                }
-                for output in tx.sapling_outputs
-            ]
-        }

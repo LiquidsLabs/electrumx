@@ -952,3 +952,116 @@ class DB:
         height, = unpack_be_uint32(value)
         return height
 
+    def iter_nullifiers_by_height(
+            self, start_height: int, end_height: int
+    ) -> List[Tuple[bytes, bytes, int]]:
+        '''Iterate nullifiers within a height range.
+
+        Returns list of (nullifier, tx_hash, height).
+        Note: This scans all nullifiers, so use sparingly for large ranges.
+        '''
+        results = []
+        # Scan all nullifiers (prefix b'N')
+        for key, value in self.utxo_db.iterator(prefix=b'N'):
+            nullifier = key[1:]  # Remove prefix
+            tx_hash = value[:32]
+            height, = unpack_be_uint32(value[32:36])
+            if start_height <= height <= end_height:
+                results.append((nullifier, tx_hash, height))
+        return results
+
+    def iter_commitments_by_height(
+            self, start_height: int, end_height: int
+    ) -> List[Tuple[bytes, bytes, int, int]]:
+        '''Iterate commitments within a height range.
+
+        Returns list of (commitment, tx_hash, output_index, height).
+        Note: This scans all commitments, so use sparingly for large ranges.
+        '''
+        results = []
+        # Scan all commitments (prefix b'C')
+        for key, value in self.utxo_db.iterator(prefix=b'C'):
+            commitment = key[1:]  # Remove prefix
+            tx_hash = value[:32]
+            output_index, = unpack_be_uint16_from(value, 32)
+            height, = unpack_be_uint32(value[34:38])
+            if start_height <= height <= end_height:
+                results.append((commitment, tx_hash, output_index, height))
+        return results
+
+    def count_nullifiers(self) -> int:
+        '''Count total nullifiers in the database.'''
+        count = 0
+        for _ in self.utxo_db.iterator(prefix=b'N'):
+            count += 1
+        return count
+
+    def count_commitments(self) -> int:
+        '''Count total commitments in the database.'''
+        count = 0
+        for _ in self.utxo_db.iterator(prefix=b'C'):
+            count += 1
+        return count
+
+    def get_sapling_tree_state(self, height: int) -> dict:
+        '''Get Sapling tree state summary up to a given height.
+
+        Returns counts and latest data for tree reconstruction.
+        '''
+        nullifier_count = 0
+        commitment_count = 0
+        latest_anchor = None
+        latest_anchor_height = 0
+
+        # Count nullifiers up to height
+        for key, value in self.utxo_db.iterator(prefix=b'N'):
+            h, = unpack_be_uint32(value[32:36])
+            if h <= height:
+                nullifier_count += 1
+
+        # Count commitments up to height
+        for key, value in self.utxo_db.iterator(prefix=b'C'):
+            h, = unpack_be_uint32(value[34:38])
+            if h <= height:
+                commitment_count += 1
+
+        # Find latest anchor at or before height
+        for key, value in self.utxo_db.iterator(prefix=b'A'):
+            h, = unpack_be_uint32(value)
+            if h <= height and h > latest_anchor_height:
+                latest_anchor_height = h
+                latest_anchor = key[1:]  # Remove prefix
+
+        return {
+            'height': height,
+            'nullifier_count': nullifier_count,
+            'commitment_count': commitment_count,
+            'latest_anchor': latest_anchor.hex() if latest_anchor else None,
+            'latest_anchor_height': latest_anchor_height,
+        }
+
+    def get_sapling_witness(
+            self,
+            commitment: bytes,
+            anchor_height: int
+    ) -> Optional[Tuple[int, List[bytes], bytes]]:
+        '''Get Merkle witness for a commitment at a given anchor height.
+
+        This requires maintaining an incremental Merkle tree which is
+        not yet implemented. Returns None for now.
+
+        For full spending support, the wallet should use a full node
+        or this method needs to be implemented with incremental tree state.
+
+        Returns (position, path, anchor) or None if not available.
+        '''
+        # TODO: Implement incremental Merkle tree for witness generation
+        # This requires:
+        # 1. Storing the commitment tree state at each block
+        # 2. Building authentication paths from stored state
+        # 3. Computing the correct anchor for the given height
+        #
+        # For now, return None to indicate witness not available
+        return None
+
+
