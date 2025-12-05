@@ -2077,3 +2077,255 @@ class NameIndexElectrumX(ElectrumX):
 
 class NameIndexAuxPoWElectrumX(NameIndexElectrumX, AuxPoWElectrumX):
     pass
+
+
+class PIVXSaplingElectrumX(ElectrumX):
+    '''ElectrumX session with PIVX Sapling shielded transaction support.
+
+    Provides RPC methods for querying Sapling nullifiers, commitments,
+    and anchors to support light wallet functionality (e.g., Cake Wallet).
+    '''
+
+    def set_request_handlers(self, ptuple):
+        super().set_request_handlers(ptuple)
+        self.request_handlers.update({
+            'blockchain.transaction.get_sapling':
+                self.transaction_get_sapling,
+            'blockchain.sapling.nullifier_status':
+                self.sapling_nullifier_status,
+            'blockchain.sapling.get_output_by_commitment':
+                self.sapling_get_output_by_commitment,
+            'blockchain.sapling.verify_anchor':
+                self.sapling_verify_anchor,
+            'blockchain.sapling.get_spends':
+                self.sapling_get_spends,
+            'blockchain.sapling.get_outputs':
+                self.sapling_get_outputs,
+        })
+
+    async def transaction_get_sapling(self, tx_hash_hex: str, verbose=False):
+        '''Get Sapling shielded transaction details.
+
+        tx_hash_hex: transaction hash as hex string
+        verbose: if True, include full Sapling component data
+
+        Returns transaction with Sapling details if it's a Sapling tx.
+        '''
+        from electrumx.lib.tx import TxPIVXSapling
+        from electrumx.lib.hash import hex_str_to_hash
+
+        self.bump_cost(1.0)
+
+        # Validate tx hash
+        tx_hash = assert_tx_hash(tx_hash_hex)
+
+        # Get raw transaction from daemon
+        try:
+            raw_tx_hex = await self.daemon_request('getrawtransaction',
+                                                   tx_hash_hex, False)
+        except DaemonError:
+            raise RPCError(BAD_REQUEST, f'transaction not found: {tx_hash_hex}')
+
+        # Deserialize the transaction
+        raw_tx = bytes.fromhex(raw_tx_hex)
+        deserializer = self.coin.DESERIALIZER(raw_tx)
+        tx = deserializer.read_tx()
+
+        result = {
+            'txid': tx_hash_hex,
+            'is_sapling': isinstance(tx, TxPIVXSapling),
+        }
+
+        if isinstance(tx, TxPIVXSapling):
+            result['value_balance'] = tx.value_balance
+            result['spend_count'] = len(tx.sapling_spends)
+            result['output_count'] = len(tx.sapling_outputs)
+
+            if verbose:
+                result['spends'] = [
+                    {
+                        'cv': spend.cv.hex(),
+                        'anchor': spend.anchor.hex(),
+                        'nullifier': spend.nullifier.hex(),
+                        'rk': spend.rk.hex(),
+                    }
+                    for spend in tx.sapling_spends
+                ]
+                result['outputs'] = [
+                    {
+                        'cv': output.cv.hex(),
+                        'cmu': output.cmu.hex(),
+                        'ephemeral_key': output.ephemeral_key.hex(),
+                        'enc_ciphertext': output.enc_ciphertext.hex(),
+                        'out_ciphertext': output.out_ciphertext.hex(),
+                    }
+                    for output in tx.sapling_outputs
+                ]
+
+        return result
+
+    async def sapling_nullifier_status(self, nullifier_hex: str):
+        '''Check if a Sapling nullifier has been spent.
+
+        nullifier_hex: 32-byte nullifier as hex string
+
+        Returns dict with spent status and tx info if spent.
+        '''
+        self.bump_cost(0.5)
+
+        # Validate nullifier
+        assert_hex_str(nullifier_hex)
+        if len(nullifier_hex) != 64:
+            raise RPCError(BAD_REQUEST, 'nullifier must be 32 bytes (64 hex)')
+
+        nullifier = bytes.fromhex(nullifier_hex)
+        result = self.db.get_nullifier_spend(nullifier)
+
+        if result is None:
+            return {'spent': False}
+
+        tx_hash, height = result
+        return {
+            'spent': True,
+            'tx_hash': hash_to_hex_str(tx_hash),
+            'height': height,
+        }
+
+    async def sapling_get_output_by_commitment(self, commitment_hex: str):
+        '''Find the output containing a specific note commitment (cmu).
+
+        commitment_hex: 32-byte commitment as hex string
+
+        Returns tx info and output index if found.
+        '''
+        self.bump_cost(0.5)
+
+        # Validate commitment
+        assert_hex_str(commitment_hex)
+        if len(commitment_hex) != 64:
+            raise RPCError(BAD_REQUEST, 'commitment must be 32 bytes (64 hex)')
+
+        commitment = bytes.fromhex(commitment_hex)
+        result = self.db.get_commitment_info(commitment)
+
+        if result is None:
+            return {'found': False}
+
+        tx_hash, output_index, height = result
+        return {
+            'found': True,
+            'tx_hash': hash_to_hex_str(tx_hash),
+            'output_index': output_index,
+            'height': height,
+        }
+
+    async def sapling_verify_anchor(self, anchor_hex: str):
+        '''Verify that a Sapling Merkle tree anchor exists.
+
+        anchor_hex: 32-byte anchor as hex string
+
+        Returns validity and the height at which it was recorded.
+        '''
+        self.bump_cost(0.5)
+
+        # Validate anchor
+        assert_hex_str(anchor_hex)
+        if len(anchor_hex) != 64:
+            raise RPCError(BAD_REQUEST, 'anchor must be 32 bytes (64 hex)')
+
+        anchor = bytes.fromhex(anchor_hex)
+        height = self.db.get_anchor_height(anchor)
+
+        if height is None:
+            return {'valid': False}
+
+        return {
+            'valid': True,
+            'height': height,
+        }
+
+    async def sapling_get_spends(self, tx_hash_hex: str):
+        '''Get Sapling spend details for a transaction.
+
+        tx_hash_hex: transaction hash as hex string
+
+        Returns list of spend details.
+        '''
+        from electrumx.lib.tx import TxPIVXSapling
+
+        self.bump_cost(1.0)
+
+        # Validate tx hash
+        assert_tx_hash(tx_hash_hex)
+
+        # Get raw transaction from daemon
+        try:
+            raw_tx_hex = await self.daemon_request('getrawtransaction',
+                                                   tx_hash_hex, False)
+        except DaemonError:
+            raise RPCError(BAD_REQUEST, f'transaction not found: {tx_hash_hex}')
+
+        # Deserialize the transaction
+        raw_tx = bytes.fromhex(raw_tx_hex)
+        deserializer = self.coin.DESERIALIZER(raw_tx)
+        tx = deserializer.read_tx()
+
+        if not isinstance(tx, TxPIVXSapling):
+            return {'spends': []}
+
+        return {
+            'spends': [
+                {
+                    'cv': spend.cv.hex(),
+                    'anchor': spend.anchor.hex(),
+                    'nullifier': spend.nullifier.hex(),
+                    'rk': spend.rk.hex(),
+                    'zkproof': spend.zkproof.hex(),
+                    'spend_auth_sig': spend.spend_auth_sig.hex(),
+                }
+                for spend in tx.sapling_spends
+            ]
+        }
+
+    async def sapling_get_outputs(self, tx_hash_hex: str):
+        '''Get Sapling output details for a transaction.
+
+        tx_hash_hex: transaction hash as hex string
+
+        Returns list of output details.
+        '''
+        from electrumx.lib.tx import TxPIVXSapling
+
+        self.bump_cost(1.0)
+
+        # Validate tx hash
+        assert_tx_hash(tx_hash_hex)
+
+        # Get raw transaction from daemon
+        try:
+            raw_tx_hex = await self.daemon_request('getrawtransaction',
+                                                   tx_hash_hex, False)
+        except DaemonError:
+            raise RPCError(BAD_REQUEST, f'transaction not found: {tx_hash_hex}')
+
+        # Deserialize the transaction
+        raw_tx = bytes.fromhex(raw_tx_hex)
+        deserializer = self.coin.DESERIALIZER(raw_tx)
+        tx = deserializer.read_tx()
+
+        if not isinstance(tx, TxPIVXSapling):
+            return {'outputs': []}
+
+        return {
+            'outputs': [
+                {
+                    'cv': output.cv.hex(),
+                    'cmu': output.cmu.hex(),
+                    'ephemeral_key': output.ephemeral_key.hex(),
+                    'enc_ciphertext': output.enc_ciphertext.hex(),
+                    'out_ciphertext': output.out_ciphertext.hex(),
+                    'zkproof': output.zkproof.hex(),
+                }
+                for output in tx.sapling_outputs
+            ]
+        }
