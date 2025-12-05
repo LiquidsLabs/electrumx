@@ -4,6 +4,7 @@ Test script for PIVX Sapling ElectrumX API endpoints.
 
 Tests the Cake Wallet compatible APIs:
 - blockchain.sapling.get_outputs (RECEIVING - trial decryption)
+- blockchain.sapling.get_block_range (RECEIVING - compact blocks)
 - blockchain.sapling.get_witness (SENDING - spend proof)
 - blockchain.sapling.get_nullifiers (SYNC)
 - blockchain.sapling.get_tree_state (SYNC)
@@ -241,8 +242,40 @@ def test_api(host: str, port: int, use_ssl: bool = False):
         print(f"  ✗ Exception: {e}")
         all_passed = False
 
-    # Test 7: blockchain.nullifier.get_spend (SYNC)
-    print("\nTest 7: blockchain.nullifier.get_spend (SYNC)")
+    # Test 7: blockchain.sapling.get_block_range (SYNC - Zcash lightwalletd compatible)
+    print("\nTest 7: blockchain.sapling.get_block_range (SYNC)")
+    print(f"  Range: {TEST_HEIGHT} to {TEST_HEIGHT}")
+    try:
+        result = client.call(
+            "blockchain.sapling.get_block_range",
+            [TEST_HEIGHT, TEST_HEIGHT]
+        )
+        if "result" in result:
+            r = result['result']
+            if isinstance(r, list):
+                print(f"  ✓ Got {len(r)} block(s)")
+                for blk in r[:2]:
+                    print(f"    - height: {blk.get('height')}")
+                    blk_hash = blk.get('hash', 'N/A')
+                    print(f"      hash: {blk_hash[:16]}...")
+                    txs = blk.get('txs', [])
+                    print(f"      txs: {len(txs)}")
+                    for tx in txs[:1]:
+                        print(f"        txid: {tx.get('txid', 'N/A')[:16]}...")
+                        outputs = tx.get('outputs', [])
+                        print(f"        outputs: {len(outputs)}")
+            else:
+                print(f"  ✗ Expected list, got: {type(r)}")
+                all_passed = False
+        elif "error" in result:
+            print(f"  ✗ Error: {result['error']}")
+            all_passed = False
+    except Exception as e:
+        print(f"  ✗ Exception: {e}")
+        all_passed = False
+
+    # Test 8: blockchain.nullifier.get_spend (SYNC)
+    print("\nTest 8: blockchain.nullifier.get_spend (SYNC)")
     print(f"  Nullifier: {TEST_NULLIFIER_1[:16]}...")
     try:
         result = client.call(
@@ -275,8 +308,8 @@ def test_api(host: str, port: int, use_ssl: bool = False):
     print("UTILITY APIs")
     print("="*60)
 
-    # Test 8: blockchain.commitment.get_info
-    print("\nTest 8: blockchain.commitment.get_info")
+    # Test 9: blockchain.commitment.get_info
+    print("\nTest 9: blockchain.commitment.get_info")
     print(f"  Commitment: {TEST_COMMITMENT_1[:16]}...")
     try:
         result = client.call(
@@ -297,8 +330,8 @@ def test_api(host: str, port: int, use_ssl: bool = False):
     except Exception as e:
         print(f"  ✗ Exception: {e}")
 
-    # Test 9: blockchain.transaction.get_sapling
-    print("\nTest 9: blockchain.transaction.get_sapling")
+    # Test 10: blockchain.transaction.get_sapling
+    print("\nTest 10: blockchain.transaction.get_sapling")
     print(f"  TX: {TEST_TX_HASH[:16]}...")
     try:
         result = client.call(

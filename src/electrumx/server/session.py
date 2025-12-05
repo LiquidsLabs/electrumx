@@ -2111,6 +2111,9 @@ class PIVXSaplingElectrumX(ElectrumX):
                 self.sapling_get_tree_state,
             'blockchain.nullifier.get_spend':
                 self.nullifier_get_spend,
+            # Zcash lightwalletd compatible methods
+            'blockchain.sapling.get_block_range':
+                self.sapling_get_block_range,
             # Additional utility methods
             'blockchain.commitment.get_info':
                 self.commitment_get_info,
@@ -2208,6 +2211,92 @@ class PIVXSaplingElectrumX(ElectrumX):
             'end_height': end_height,
             'more': output_count >= limit,
         }
+
+    async def sapling_get_block_range(
+            self,
+            start_height: int,
+            end_height: int
+    ):
+        '''Get compact block data for a height range (Zcash lightwalletd compatible).
+
+        Returns blocks with Sapling outputs for trial decryption.
+        Each block contains: height, hash, and list of compact transactions.
+        Each transaction contains: txid and list of outputs.
+        Each output contains: cmu, epk, enc_ciphertext.
+
+        start_height: starting block height (inclusive)
+        end_height: ending block height (inclusive)
+
+        Returns list of compact blocks.
+        '''
+        from electrumx.lib.tx import TxPIVXSapling
+
+        start_height = non_negative_integer(start_height)
+        end_height = non_negative_integer(end_height)
+
+        if end_height < start_height:
+            raise RPCError(BAD_REQUEST, 'end_height must be >= start_height')
+
+        max_blocks = 1000
+        if end_height - start_height > max_blocks:
+            raise RPCError(
+                BAD_REQUEST,
+                f'range too large, max {max_blocks} blocks'
+            )
+
+        # Cost based on range size
+        self.bump_cost(2.0 + (end_height - start_height) * 0.2)
+
+        blocks = []
+
+        for height in range(start_height, end_height + 1):
+            # Get block hash at height
+            try:
+                block_hash = await self.daemon_request('getblockhash', height)
+            except DaemonError:
+                break  # Height doesn't exist yet
+
+            # Get full block
+            try:
+                block_hex = await self.daemon_request(
+                    'getblock', block_hash, 0
+                )
+            except DaemonError:
+                continue
+
+            block_data = bytes.fromhex(block_hex)
+            header_size = self.coin.header_len(height)
+
+            # Deserialize transactions
+            deserializer = self.coin.DESERIALIZER(
+                block_data, start=header_size
+            )
+            tx_count = deserializer.read_varint()
+
+            compact_txs = []
+            for _ in range(tx_count):
+                tx = deserializer.read_tx()
+                if isinstance(tx, TxPIVXSapling) and tx.sapling_outputs:
+                    compact_outputs = []
+                    for output in tx.sapling_outputs:
+                        compact_outputs.append({
+                            'cmu': output.cmu.hex(),
+                            'epk': output.ephemeral_key.hex(),
+                            'ciphertext': output.enc_ciphertext.hex(),
+                        })
+                    compact_txs.append({
+                        'txid': tx.txid.hex(),
+                        'outputs': compact_outputs,
+                    })
+
+            # Always include block even if no Sapling txs (for sync continuity)
+            blocks.append({
+                'height': height,
+                'hash': block_hash,
+                'txs': compact_txs,
+            })
+
+        return blocks
 
     async def sapling_get_witness(
             self,
