@@ -2268,7 +2268,7 @@ class PIVXSaplingElectrumX(ElectrumX):
                 zip(block_hashes, raw_blocks)
             ):
                 height = start_height + i
-                header_size = self.coin.header_len(height)
+                header_size = self.coin.static_header_len(height)
 
                 # Extract timestamp from header (at offset 68, 4 bytes LE)
                 # Header: version(4) + prev_hash(32) + merkle(32) + time(4)
