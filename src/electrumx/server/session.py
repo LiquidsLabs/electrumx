@@ -2274,15 +2274,14 @@ class PIVXSaplingElectrumX(ElectrumX):
                 # Header: version(4) + prev_hash(32) + merkle(32) + time(4)
                 block_time = int.from_bytes(block_data[68:72], 'little')
 
-                # Deserialize transactions
+                # Deserialize transactions using read_tx_block
                 deserializer = self.coin.DESERIALIZER(
                     block_data, start=header_size
                 )
-                tx_count = deserializer.read_varint()
+                txs = deserializer.read_tx_block()
 
                 compact_txs = []
-                for _ in range(tx_count):
-                    tx = deserializer.read_tx()
+                for tx in txs:
                     if isinstance(tx, TxPIVXSapling) and (
                         tx.sapling_outputs or tx.sapling_spends
                     ):
