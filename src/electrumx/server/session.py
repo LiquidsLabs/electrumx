@@ -1029,14 +1029,17 @@ class SessionBase(RPCSessionWithTaskGroup):
             handler = None
         method = 'invalid method' if handler is None else request.method
 
+        # Methods that are allowed before version negotiation (for Cake Wallet compatibility)
+        pre_version_allowed = {'server.version', 'server.ping', 'server.features', 'server.banner'}
+
         # Version negotiation must happen before any other messages.
-        if not self.sv_seen and method != 'server.version':
+        if not self.sv_seen and method not in pre_version_allowed:
             self.logger.info(f'closing session: server.version must be first msg. got: {method}')
             await self._do_crash_old_electrum_client()
             raise ReplyAndDisconnect(RPCError(
                 BAD_REQUEST, f'use server.version to identify client'))
         # Wait for version negotiation to finish before processing other messages.
-        if method != 'server.version' and not self.sv_negotiated.is_set():
+        if method not in pre_version_allowed and not self.sv_negotiated.is_set():
             await self.sv_negotiated.wait()
 
         self.session_mgr._method_counts[method] += 1
